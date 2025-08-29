@@ -720,3 +720,4 @@ def client_dashboard(request):
             'defects': unique_defects
         })
     return Response(result)
+
