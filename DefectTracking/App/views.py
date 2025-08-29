@@ -16,6 +16,10 @@ from .models import Project, UserProfile, Defect, Mentor, DefectHistory
 from .serializers import (ProjectSerializer, UserRegistrationSerializer, DefectSerializer,DefectCreateSerializer, DefectUpdateSerializer, MentorSerializer,
     DefectStatsSerializer, UserProfileSerializer, MentorLoginSerializer,DefectActionSerializer, UserLoginSerializer, DefectListSerializer,DefectDetailSerializer)
 from .permissions import IsMentor
+from django.conf import settings
+from .ai_utils import ai_filter_unique_defects
+
+AI_FILTER_UNIQUE_DEFECTS_THRESHOLD = 0.3  # Centralized threshold for AI clustering
 class ProjectListView(generics.ListAPIView):
     """Get list of all active projects"""
     queryset = Project.objects.filter(is_active=True)
@@ -179,26 +183,43 @@ def mentor_projects(request):
     return Response(serializer.data)
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated, IsMentor])
+def get_defect_detail(request, defect_id):
+    mentor = Mentor.objects.get(user=request.user)
+    defect = get_object_or_404(Defect, defect_id=defect_id, project__mentors=mentor)
+    serializer = DefectDetailSerializer(defect, context={'request': request})
+    return Response(serializer.data)
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated, IsMentor])
 def mentor_project_defects(request, project_id):
     try:
         mentor = Mentor.objects.get(user=request.user)
-    except Mentor.DoesNotExist:
-        return Response({'error': 'Unauthorized: Not a mentor'}, status=403)
-    if not mentor.projects.filter(id=project_id).exists():
-        return Response({'error': 'Project not assigned to this mentor'}, status=403)
-    defects = Defect.objects.filter(project_id=project_id)
-    serializer = DefectListSerializer(defects, many=True)
-    return Response(serializer.data)
+        if not mentor.projects.filter(id=project_id).exists():
+            return Response({'error': 'Project not assigned to this mentor'}, status=403)
+        defects = Defect.objects.filter(project_id=project_id)
+        serializer = DefectListSerializer(defects, many=True, context={'request': request})
+        return Response(serializer.data)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return Response({'error': str(e)}, status=500)
 @api_view(['GET', 'PUT', 'PATCH'])
 @permission_classes([permissions.IsAuthenticated, IsMentor])
 def mentor_defect_detail(request, defect_id):
     mentor = Mentor.objects.get(user=request.user)
     defect = get_object_or_404(Defect, defect_id=defect_id, project__mentors=mentor)
+    
     if request.method == 'GET':
         serializer = DefectDetailSerializer(defect)
         return Response(serializer.data)
+    
     elif request.method in ['PUT', 'PATCH']:
-        serializer = DefectUpdateSerializer(defect, data=request.data, partial=True)
+        # For file uploads, we need to use request.data directly
+        if request.content_type.startswith('multipart/form-data'):
+            serializer = DefectUpdateSerializer(defect, data=request.data, partial=True)
+        else:
+            serializer = DefectUpdateSerializer(defect, data=request.data, partial=True)
+            
         if serializer.is_valid():
             serializer.save()
             # Log update in DefectHistory
@@ -207,7 +228,8 @@ def mentor_defect_detail(request, defect_id):
                 action='UPDATED',
                 performed_by=request.user,
                 changes=serializer.validated_data,
-                comments=request.data.get('comments', ''))
+                comments=request.data.get('comments', '')
+            )
             return Response({'success': True, 'defect': DefectDetailSerializer(defect).data})
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 @api_view(['PATCH'])
@@ -222,6 +244,7 @@ def mentor_defect_approve(request, defect_id):
     if defect.status == 'APPROVED':
         return Response({'error': 'Already approved'}, status=400)
     defect.status = 'APPROVED'
+    defect.mentor_state = 'Approved'
     defect.approved_by = request.user
     defect.approved_at = timezone.now()
     defect.save()
@@ -243,6 +266,7 @@ def mentor_defect_invalidate(request, defect_id):
     if defect.status == 'INVALID':
         return Response({'error': 'Already invalidated'}, status=400)
     defect.status = 'INVALID'
+    defect.mentor_state = 'Invalid'
     defect.save()
     DefectHistory.objects.create(
         defect=defect,
@@ -298,6 +322,13 @@ def mentor_students_view(request):
                     "created_at": d.created_at,}
                 for d in defects]})
         return Response(data)
+class DefectListAPIView(APIView):
+    permission_classes = [IsAuthenticated]  # Optional: enforce login
+
+    def get(self, request, *args, **kwargs):
+        defects = Defect.objects.all()
+        serializer = DefectListSerializer(defects, many=True, context={'request': request})
+        return Response(serializer.data)
 class DefectListCreateView(generics.ListCreateAPIView):
     """List defects and create new defects"""
     queryset = Defect.objects.all()
@@ -326,7 +357,7 @@ class DefectListCreateView(generics.ListCreateAPIView):
     def post(self, request, *args, **kwargs):
         serializer = DefectCreateSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
-        serializer.save(created_by=request.user)
+        serializer.save()
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
     def get_queryset(self):
@@ -527,13 +558,14 @@ class MentorProjectsView(generics.RetrieveAPIView):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def user_profile(request):
-    """Get current user profile"""
     try:
         profile = UserProfile.objects.get(user=request.user)
         serializer = UserProfileSerializer(profile)
         return Response(serializer.data)
     except UserProfile.DoesNotExist:
         return Response({'error': 'Profile not found'}, status=404)
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def user_dashboard(request):
@@ -592,62 +624,6 @@ class ClientLoginView(APIView):
             'role': profile.role,
             'project': projects
         }, status=status.HTTP_200_OK)
-
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def client_unique_defects_view(request):
-    """
-    Stub endpoint for client unique defects.
-    ReplaIsAuthenticatedce this with actual logic as needed.
-    """
-    return Response({"message": "Client unique defects endpoint is under construction."})
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def client_dashboard(request):
-    """
-    Client dashboard showing only unique defects (by summary, earliest created) for each assigned client project.
-    """
-    try:
-        profile = request.user.userprofile
-    except Exception:
-        return Response({'error': 'User profile not found.'}, status=404)
-
-    if profile.role != 'client':
-        return Response({'error': 'User is not a client.'}, status=403)
-
-    projects = profile.projects.all()
-    if not projects:
-        return Response({'error': 'No project assigned to this client.'}, status=404)
-
-    result = []
-    for project in projects:
-        # Get all defects for the project
-        defects = Defect.objects.filter(project=project).order_by('created_at')
-        # Use a dict to keep only the first defect for each summary
-        unique_defects_dict = {}
-        for defect in defects:
-            if defect.summary not in unique_defects_dict:
-                unique_defects_dict[defect.summary] = defect
-
-        unique_defects = [
-            {
-                'defect_id': d.defect_id,
-                'summary': d.summary,
-                'status': d.status,
-                'created_by__username': d.created_by.username,
-                'severity': d.severity,
-                'priority': d.priority,
-                'created_at': d.created_at,
-            }
-            for d in unique_defects_dict.values()
-        ]
-
-        result.append({
-            'project': project.name,
-            'defects': unique_defects
-        })
-
-    return Response(result)
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def client_projects(request):
@@ -669,34 +645,18 @@ def client_project_defects(request, project_id):
         profile = request.user.userprofile
     except UserProfile.DoesNotExist:
         return Response({'error': 'User profile not found.'}, status=404)
-
     if profile.role != 'client':
         return Response({'error': 'User is not a client.'}, status=403)
-
-    # Verify project belongs to client
     project = get_object_or_404(profile.projects, id=project_id)
-    defects = Defect.objects.filter(project=project).values(
-        'defect_id',
-        'summary',
-        'status',
-        'created_at',
-        'priority',
-        'created_by__username',  # Reported By
-        # Add 'severity' here if present
-    )
+    defects_qs = Defect.objects.filter(project=project, status='APPROVED')
+    serializer = DefectListSerializer(defects_qs, many=True, context={'request': request})
+    defect_dicts = serializer.data
+    # --------- USE AI CLUSTERING HERE ---------
+    unique_defects = ai_filter_unique_defects(defect_dicts, AI_FILTER_UNIQUE_DEFECTS_THRESHOLD)
     return Response({
         'project': project.name,
-        'defects': list(defects)
+        'defects': unique_defects
     })
-def ai_filter_unique_defects(defects):
-    """
-    Use AI to cluster defects by similarity and pick unique representatives.
-    Implement with your preferred AI/embedding model here.
-    """
-    unique_defects = []
-    # ... AI-based filtering logic ...
-    return unique_defects
-
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def client_unique_defects_view(request):
@@ -709,12 +669,55 @@ def client_unique_defects_view(request):
         return Response({'error': 'User is not a client.'}, status=403)
 
     # Fetch all defects for client projects
-    defects = Defect.objects.filter(project__in=profile.projects.all()).values(
-        'defect_id', 'summary', 'status', 'created_at', 'steps_to_reproduce', 'actual_result', 'expected_result'
-    )
+    defects = list(Defect.objects.filter(project__in=profile.projects.all()).values(
+        'defect_id', 'summary', 'status', 'created_at', 'steps_to_reproduce', 'actual_result', 'expected_result','environment'
+    ))
     defects_list = list(defects)
 
     # Apply AI-based filtering to get unique defects
-    unique_defects = ai_filter_unique_defects(defects_list)
+    unique_defects = ai_filter_unique_defects(defects,AI_FILTER_UNIQUE_DEFECTS_THRESHOLD)
 
     return Response({'unique_defects': unique_defects})
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def client_dashboard(request):
+    try:
+        profile = request.user.userprofile
+    except Exception:
+        return Response({'error': 'User profile not found.'}, status=404)
+    if profile.role != 'client':
+        return Response({'error': 'User is not a client.'}, status=403)
+    projects = profile.projects.all()
+    if not projects:
+        return Response({'error': 'No project assigned to this client.'}, status=404)
+    result = []
+    for project in projects:
+        defects = list(Defect.objects.filter(
+            project=project,
+            status='APPROVED',
+            created_by=request.user
+        ).values(
+            'defect_id',
+            'summary',
+            'status',
+            'created_by__username',
+            'priority',
+            'created_at',
+            'environment',
+            'application_url',
+            'defect_screenshots',
+            'defect_video'
+        ))
+        for d in defects:
+            if d['defect_video']:
+                d['defect_video'] = request.build_absolute_uri(settings.MEDIA_URL + d['defect_video'])
+            if d['defect_screenshots']:
+                d['defect_screenshots'] = request.build_absolute_uri(settings.MEDIA_URL + d['defect_screenshots'])
+        # --------- USE AI CLUSTERING HERE ---------
+        unique_defects = ai_filter_unique_defects(list(defects),AI_FILTER_UNIQUE_DEFECTS_THRESHOLD)
+        result.append({
+            'project': project.name,
+            'defects': unique_defects
+        })
+    return Response(result)
+

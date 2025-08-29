@@ -1,8 +1,7 @@
-# App/urls.py (or your main app's urls.py)
 from django.urls import path, re_path
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
-from .views import similar_defects_view
-from .import views 
+from .views import similar_defects_view, DefectListCreateView, DefectListAPIView
+from . import views
 try:
     from .swagger import schema_view
     SWAGGER_AVAILABLE = True
@@ -25,6 +24,7 @@ urlpatterns = [
     path('defects/<int:defect_id>/invalidate/', views.invalidate_defect, name='invalidate_defect'),
     path('defects/stats/', views.defect_stats, name='defect_stats'),
     path('api/defects/similar/', similar_defects_view, name='similar-defects'),
+    path('api/defects/', DefectListAPIView.as_view(), name='defect-list'),
     # Mentors
     path('mentor/projects/', views.MentorProjectsView.as_view(), name='mentor_projects'),
     path('mentor/defects/', views.mentor_student_defects, name='mentor_student_defects'),

@@ -45,7 +45,7 @@ class ProjectAdmin(admin.ModelAdmin):
 # --- Defect Admin ---
 @admin.register(Defect)
 class DefectAdmin(admin.ModelAdmin):
-    list_display = ['defect_id', 'summary', 'priority', 'status', 'project', 'created_by', 'created_at']
+    list_display = ['defect_id', 'summary', 'priority', 'status', 'project', 'environment', 'application_url', 'defect_screenshots', 'created_by', 'created_at']
     list_filter = ['status', 'priority', 'project', 'created_at']
     search_fields = ['summary', 'defect_id']
     readonly_fields = ['defect_id', 'created_at', 'updated_at', 'approved_at']
@@ -55,7 +55,7 @@ class DefectAdmin(admin.ModelAdmin):
             'fields': ('defect_id', 'project', 'summary', 'priority')
         }),
         ('Details', {
-            'fields': ('actual_result', 'expected_result')
+            'fields': ('environment', 'application_url', 'actual_result', 'expected_result', 'defect_screenshots')
         }),
         ('Status & Approval', {
             'fields': ('status', 'approved_by')
@@ -64,6 +64,11 @@ class DefectAdmin(admin.ModelAdmin):
             'fields': ('created_at', 'updated_at', 'approved_at')
         }),
     )
+    def save_model(self, request, obj, form, change):
+        # If creating a new defect, set created_by to current user
+        if not change or not obj.created_by:
+            obj.created_by = request.user
+        super().save_model(request, obj, form, change)
 # --- Mentor Admin ---
 @admin.register(Mentor)
 class MentorAdmin(admin.ModelAdmin):
